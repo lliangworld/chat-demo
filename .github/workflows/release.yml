@@ -1,0 +1,518 @@
+# ============================================================================
+# 发布构建：Windows 单文件 exe + Android APK（本文件只存在于 release 分支）
+#
+# 使用方式（main 保持与上游同步、零改动，所有发布动作都在 release 分支上）：
+#   1. 正式发布：在 release 分支上打 tag 并推送，自动构建并创建 GitHub Release：
+#        git tag v1.0.0-20261116 && git push origin v1.0.0-20261116
+#      tag 格式：v<semver>-<YYYYMMDD>（第一个版本 v1.0.0-20261116）。
+#      注意：tag 必须指向包含本 workflow 的 release 分支提交；打在 main 上
+#      不会触发（main 上没有本文件，天然防误触）。
+#   2. 手动构建（只出 Actions Artifacts，不创建 Release）：
+#        gh workflow run release.yml --ref release
+#        可选 -f version=1.0.0-20261116（合法 semver），留空为 0.0.0-snapshot.<run_number>
+#   3. 上游同步：GitHub "Sync fork" 更新 main → 把 main 合并进 release → 打新 tag。
+#      release 分支不修改 package.json 等上游文件，合并不会产生冲突。
+#
+# 版本规则：tag 剥离前缀 v 即产物版本（v1.0.0-20261116 → 1.0.0-20261116）；
+#   Android versionCode 取末尾 8 位日期（单调递增）。
+#
+# 桌面 exe：Go 纯标准库单文件（go:embed 内嵌 dist），双击后：
+#   监听 http://127.0.0.1:9999（默认，可用 -port 改）→ 自动打开系统默认浏览器，
+#   控制台窗口实时显示访问日志。固定端口是因为浏览器按“来源（含端口）”隔离
+#   localStorage/IndexedDB，随机端口会导致历史聊天每次清空。
+#
+# 已知限制：产物未签名（SmartScreen / Play Protect 会提示，正常）；APK 为 CI
+#   临时 debug 签名，升级安装需先卸载旧版，且不能上架商店；exe 使用期间需保持
+#   控制台窗口开启；仅监听 127.0.0.1，局域网不可访问。
+# ============================================================================
+
+name: Release Builds (exe & APK)
+
+on:
+  push:
+    tags:
+      - 'v*-*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（合法 semver，如 1.0.0-20261116），留空用 0.0.0-snapshot.<run_number>'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Windows 单文件 exe：pnpm 构建静态站点 → go:embed 内嵌 → 本地服务 + 自动开浏览器
+  # ---------------------------------------------------------------------------
+  build-windows-exe:
+    name: Windows exe (local server + browser)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve version
+        id: version
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+            if ! echo "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-[0-9]{8}$'; then
+              echo "::error::tag '$tag' 不符合格式 v<semver>-<YYYYMMDD>，例如 v1.0.0-20261116"
+              exit 1
+            fi
+            version="${tag#v}"
+            datecode="${tag##*-}"
+            if ! date -d "${datecode:0:4}-${datecode:4:2}-${datecode:6:2}" >/dev/null 2>&1; then
+              echo "::error::tag 日期段 '$datecode' 不是合法日期"
+              exit 1
+            fi
+          else
+            version="${VERSION_INPUT:-0.0.0-snapshot.${RUN_NUMBER}}"
+            datecode="$(date +%Y%m%d)"
+            if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+              echo "::error::版本号 '$version' 不是合法 semver（示例：1.0.0-20261116）"
+              exit 1
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "datecode=$datecode" >> "$GITHUB_OUTPUT"
+          echo "构建版本：$version（versionCode/日期码：$datecode）"
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: 12.6.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check types
+        run: pnpm type
+
+      - name: Lint
+        run: pnpm lint
+
+      # 注意：不能用 pnpm build——pnpm 在 Windows 上用 cmd.exe 执行脚本，
+      # “NODE_ENV=production ...” 前缀语法会失败；这里在 bash 中等价直调（与
+      # package.json 的 build 脚本行为一致：rm -rf dist && NODE_ENV=production rspack build）。
+      - name: Build web app
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          NODE_ENV=production pnpm exec rspack build -c rspack.config.ts
+
+      - name: Generate placeholder icon
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gopack"
+          cd "$RUNNER_TEMP/gopack"
+          cat > icon.svg <<'EOF'
+          <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+            <defs>
+              <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#4f8cff"/>
+                <stop offset="1" stop-color="#7c5cff"/>
+              </linearGradient>
+            </defs>
+            <rect width="1024" height="1024" rx="220" fill="url(#g)"/>
+            <rect x="248" y="264" width="528" height="380" rx="80" fill="#ffffff"/>
+            <path d="M400 620 L400 760 L520 620 Z" fill="#ffffff"/>
+            <circle cx="412" cy="454" r="34" fill="#4f8cff"/>
+            <circle cx="512" cy="454" r="34" fill="#4f8cff"/>
+            <circle cx="612" cy="454" r="34" fill="#4f8cff"/>
+          </svg>
+          EOF
+          npm install --no-fund --no-audit --no-save sharp-cli @tauri-apps/cli@latest
+          npx --no-install sharp-cli -i icon.svg -o icon-1024.png resize 1024 1024
+          npx --no-install tauri icon icon-1024.png --output tauri-icons
+          ls -l tauri-icons
+
+      - name: Generate Go server scaffold
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/gopack"
+          cp -r "$GITHUB_WORKSPACE/dist" dist
+          cat > go.mod <<'EOF'
+          module chatdemo
+
+          go 1.24
+          EOF
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+          	"bufio"
+          	"embed"
+          	"flag"
+          	"fmt"
+          	"io/fs"
+          	"log"
+          	"net"
+          	"net/http"
+          	"os"
+          	"os/exec"
+          	"os/signal"
+          	"runtime"
+          	"syscall"
+          	"time"
+          )
+
+          // dist 为内嵌的静态站点（由 CI 在构建前拷入本目录）。
+          //
+          //go:embed all:dist
+          var distFS embed.FS
+
+          // version 由 CI 通过 -ldflags "-X main.version=..." 注入（取自发布 tag）。
+          var version = "dev"
+
+          // 固定默认端口：浏览器按“来源（协议+域名+端口）”隔离 localStorage/IndexedDB，
+          // 随机端口会导致每次启动都看不到历史聊天记录，因此默认固定为 9999。
+          const defaultPort = "9999"
+
+          func main() {
+          	port := flag.String("port", defaultPort, "HTTP 监听端口（默认 9999；更换端口将无法看到原端口下保存的聊天记录）")
+          	flag.Parse()
+
+          	addr := net.JoinHostPort("127.0.0.1", *port)
+          	ln, err := net.Listen("tcp", addr)
+          	if err != nil {
+          		fatal(fmt.Sprintf("无法监听 %s：%v\n端口可能已被占用，可用 -port <端口号> 更换（浏览器按端口隔离站点存储，换端口后看不到旧聊天记录）。",
+          			addr, err))
+          	}
+
+          	sub, err := fs.Sub(distFS, "dist")
+          	if err != nil {
+          		fatal(fmt.Sprintf("读取内嵌资源失败：%v", err))
+          	}
+
+          	url := fmt.Sprintf("http://127.0.0.1:%s", *port)
+
+          	log.Printf("Chat Demo %s", version)
+          	log.Printf("本地服务已启动：%s", url)
+          	log.Printf("正在自动打开浏览器…请保持本窗口开启，关闭窗口或按 Ctrl+C 即退出。")
+          	log.Printf("提示：-port 可更换端口，-h 查看帮助。")
+
+          	openBrowser(url)
+
+          	srv := &http.Server{
+          		Handler:           withLog(http.FileServer(http.FS(sub))),
+          		ReadHeaderTimeout: 10 * time.Second,
+          	}
+
+          	go func() {
+          		sig := make(chan os.Signal, 1)
+          		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+          		<-sig
+          		log.Println("收到退出信号，正在关闭…")
+          		_ = srv.Close()
+          		os.Exit(0)
+          	}()
+
+          	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+          		fatal(fmt.Sprintf("服务异常退出：%v", err))
+          	}
+          }
+
+          // withLog 为每条请求输出一行访问日志。
+          func withLog(next http.Handler) http.Handler {
+          	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+          		start := time.Now()
+          		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+          		next.ServeHTTP(rec, r)
+          		log.Printf("%-4s %-28s %d %6dms  %s",
+          			r.Method, r.URL.Path, rec.status, time.Since(start).Milliseconds(), r.RemoteAddr)
+          	})
+          }
+
+          type statusRecorder struct {
+          	http.ResponseWriter
+          	status int
+          }
+
+          func (r *statusRecorder) WriteHeader(code int) {
+          	r.status = code
+          	r.ResponseWriter.WriteHeader(code)
+          }
+
+          func openBrowser(url string) {
+          	var cmd *exec.Cmd
+          	switch runtime.GOOS {
+          	case "windows":
+          		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+          	case "darwin":
+          		cmd = exec.Command("open", url)
+          	default:
+          		cmd = exec.Command("xdg-open", url)
+          	}
+          	if err := cmd.Start(); err != nil {
+          		log.Printf("自动打开浏览器失败，请手动访问上面的地址：%v", err)
+          	}
+          }
+
+          // fatal 输出错误并等待回车，避免双击启动时控制台一闪而过看不到原因。
+          func fatal(msg string) {
+          	fmt.Fprintln(os.Stderr, "\n[错误] "+msg)
+          	fmt.Fprint(os.Stderr, "\n按回车键退出…")
+          	_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+          	os.Exit(1)
+          }
+          EOF
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+
+      - name: Embed application icon
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/gopack"
+          go run github.com/akavel/rsrc@latest -ico tauri-icons/icon.ico -arch amd64 -o rsrc_windows_amd64.syso \
+            || echo "::warning::跳过 exe 图标嵌入（rsrc 执行失败，不影响功能）"
+
+      - name: Build exe
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/gopack"
+          go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "ChatDemo-${VERSION}-windows-x64.exe" .
+          ls -l ChatDemo-*.exe
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-exe
+          path: ${{ runner.temp }}/gopack/ChatDemo-*.exe
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Android APK：pnpm 构建静态站点 → CI 临时生成 Capacitor 工程 → gradle 打 debug APK
+  # ---------------------------------------------------------------------------
+  build-android-apk:
+    name: Android APK (Capacitor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve version
+        id: version
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+            if ! echo "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-[0-9]{8}$'; then
+              echo "::error::tag '$tag' 不符合格式 v<semver>-<YYYYMMDD>，例如 v1.0.0-20261116"
+              exit 1
+            fi
+            version="${tag#v}"
+            datecode="${tag##*-}"
+            if ! date -d "${datecode:0:4}-${datecode:4:2}-${datecode:6:2}" >/dev/null 2>&1; then
+              echo "::error::tag 日期段 '$datecode' 不是合法日期"
+              exit 1
+            fi
+          else
+            version="${VERSION_INPUT:-0.0.0-snapshot.${RUN_NUMBER}}"
+            datecode="$(date +%Y%m%d)"
+            if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+              echo "::error::版本号 '$version' 不是合法 semver（示例：1.0.0-20261116）"
+              exit 1
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "datecode=$datecode" >> "$GITHUB_OUTPUT"
+          echo "构建版本：$version（versionCode/日期码：$datecode）"
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: 12.6.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check types
+        run: pnpm type
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Build web app
+        run: pnpm build
+
+      - name: Set up JDK
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Scaffold Capacitor project
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cap-pack"
+          cd "$RUNNER_TEMP/cap-pack"
+          npm init -y >/dev/null
+          npm install --no-fund --no-audit @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "io.github.lliangworld.chatdemo",
+            "appName": "Chat Demo",
+            "webDir": "www"
+          }
+          EOF
+          mkdir -p www
+          cp -r "$GITHUB_WORKSPACE/dist"/. www/
+          npx cap add android
+          npx cap sync android
+
+      - name: Apply launcher icons, permissions and version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          DATECODE: ${{ steps.version.outputs.datecode }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/cap-pack"
+          cat > icon.svg <<'EOF'
+          <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+            <defs>
+              <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#4f8cff"/>
+                <stop offset="1" stop-color="#7c5cff"/>
+              </linearGradient>
+            </defs>
+            <rect width="1024" height="1024" rx="220" fill="url(#g)"/>
+            <rect x="248" y="264" width="528" height="380" rx="80" fill="#ffffff"/>
+            <path d="M400 620 L400 760 L520 620 Z" fill="#ffffff"/>
+            <circle cx="412" cy="454" r="34" fill="#4f8cff"/>
+            <circle cx="512" cy="454" r="34" fill="#4f8cff"/>
+            <circle cx="612" cy="454" r="34" fill="#4f8cff"/>
+          </svg>
+          EOF
+          cat > icon-round.svg <<'EOF'
+          <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+            <defs>
+              <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#4f8cff"/>
+                <stop offset="1" stop-color="#7c5cff"/>
+              </linearGradient>
+            </defs>
+            <circle cx="512" cy="512" r="512" fill="url(#g)"/>
+            <rect x="248" y="264" width="528" height="380" rx="80" fill="#ffffff"/>
+            <path d="M400 620 L400 760 L520 620 Z" fill="#ffffff"/>
+            <circle cx="412" cy="454" r="34" fill="#4f8cff"/>
+            <circle cx="512" cy="454" r="34" fill="#4f8cff"/>
+            <circle cx="612" cy="454" r="34" fill="#4f8cff"/>
+          </svg>
+          EOF
+          cat > icon-foreground.svg <<'EOF'
+          <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+            <g transform="translate(194.56 194.56) scale(0.62)">
+              <rect x="248" y="264" width="528" height="380" rx="80" fill="#ffffff"/>
+              <path d="M400 620 L400 760 L520 620 Z" fill="#ffffff"/>
+              <circle cx="412" cy="454" r="34" fill="#4f8cff"/>
+              <circle cx="512" cy="454" r="34" fill="#4f8cff"/>
+              <circle cx="612" cy="454" r="34" fill="#4f8cff"/>
+            </g>
+          </svg>
+          EOF
+          npm install --no-fund --no-audit --no-save sharp-cli
+          RES=android/app/src/main/res
+          for spec in mdpi:48:108 hdpi:72:162 xhdpi:96:216 xxhdpi:144:324 xxxhdpi:192:432; do
+            d="${spec%%:*}"; rest="${spec#*:}"; launcher="${rest%%:*}"; fg="${rest##*:}"
+            npx --no-install sharp-cli -i icon.svg -o "$RES/mipmap-$d/ic_launcher.png" resize "$launcher" "$launcher"
+            npx --no-install sharp-cli -i icon-round.svg -o "$RES/mipmap-$d/ic_launcher_round.png" resize "$launcher" "$launcher"
+            npx --no-install sharp-cli -i icon-foreground.svg -o "$RES/mipmap-$d/ic_launcher_foreground.png" resize "$fg" "$fg"
+          done
+          bg="$RES/values/ic_launcher_background.xml"
+          if [ -f "$bg" ]; then
+            sed -i -E 's/>#[0-9A-Fa-f]{6,8}</>#4f8cff</' "$bg"
+          else
+            echo "::warning::未找到 $bg，跳过图标背景色替换"
+          fi
+          sed -i 's#</manifest>#    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n</manifest>#' android/app/src/main/AndroidManifest.xml
+          sed -i "s/versionCode 1/versionCode $DATECODE/" android/app/build.gradle
+          sed -i "s/versionName \"1.0\"/versionName \"$VERSION\"/" android/app/build.gradle
+          grep -nE 'versionCode|versionName' android/app/build.gradle
+          grep -n 'RECORD_AUDIO' android/app/src/main/AndroidManifest.xml
+
+      - name: Build debug APK
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/cap-pack/android"
+          ./gradlew assembleDebug --no-daemon
+          cd ..
+          cp android/app/build/outputs/apk/debug/app-debug.apk "ChatDemo-${VERSION}-android.apk"
+          ls -l ChatDemo-*.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-apk
+          path: ${{ runner.temp }}/cap-pack/ChatDemo-*.apk
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 发布：仅 tag 触发时执行，把两个产物上传到 GitHub Release
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    if: github.ref_type == 'tag'
+    needs: [build-windows-exe, build-android-apk]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist-artifacts
+          merge-multiple: true
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ls -l dist-artifacts
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber dist-artifacts/*
+          else
+            gh release create "$TAG" --title "Chat Demo $TAG" --generate-notes dist-artifacts/*
+          fi
