@@ -16,14 +16,17 @@
 # 版本规则：tag 剥离前缀 v 即产物版本（v1.0.0-20261116 → 1.0.0-20261116）；
 #   Android versionCode 取末尾 8 位日期（单调递增）。
 #
-# 桌面 exe：Go 纯标准库单文件（go:embed 内嵌 dist），双击后：
-#   监听 http://127.0.0.1:9999（默认，可用 -port 改）→ 自动打开系统默认浏览器，
-#   控制台窗口实时显示访问日志。固定端口是因为浏览器按“来源（含端口）”隔离
-#   localStorage/IndexedDB，随机端口会导致历史聊天每次清空。
+# 桌面 exe：Tauri 2 原生壳（Rust + 系统 WebView2），CI 生成脚手架并内嵌 dist，
+#   产物为单文件 exe（约 5MB），双击即用；Win10 1803+/Win11 自带 WebView2。
+#   外链自动转系统浏览器打开；麦克风免权限弹窗；原生 GUI 窗口（无控制台）。
+#   数据存放于独立 WebView2 profile（与浏览器、旧版 Go exe、APK 互不相通）：
+#     API Key 与设置：%LOCALAPPDATA%\io.github.lliangworld.chatdemo\EBWebView\Default\Local Storage\leveldb\
+#     对话与附件：     %LOCALAPPDATA%\io.github.lliangworld.chatdemo\EBWebView\Default\IndexedDB\http_tauri.localhost_0.indexeddb.leveldb\
+#   删除/替换 exe 不丢数据；重装保留；备份=退出应用后拷贝上述目录；清除=删除 EBWebView。
 #
 # 已知限制：产物未签名（SmartScreen / Play Protect 会提示，正常）；APK 为 CI
-#   临时 debug 签名，升级安装需先卸载旧版，且不能上架商店；exe 使用期间需保持
-#   控制台窗口开启；仅监听 127.0.0.1，局域网不可访问。
+#   临时 debug 签名，升级安装需先卸载旧版，且不能上架商店；Tauri exe 首次构建
+#   冷编译 Rust 约 15-25 分钟（有 cargo 缓存后约 2-4 分钟）。
 # ============================================================================
 
 name: Release Builds (exe & APK)
@@ -57,12 +60,13 @@ defaults:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Windows 单文件 exe：pnpm 构建静态站点 → go:embed 内嵌 → 本地服务 + 自动开浏览器
+  # Windows 单文件 exe：pnpm 构建静态站点 → CI 生成 Tauri 2 脚手架（Rust 壳内嵌
+  # dist）→ 原生单文件 exe（约 5MB，依赖系统 WebView2，Win10 1803+/Win11 自带）。
   # ---------------------------------------------------------------------------
-  build-windows-exe:
-    name: Windows exe (local server + browser)
+  build-tauri-exe:
+    name: Windows exe (Tauri native shell)
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     # 诊断模式只构建 APK，跳过 exe
     if: github.event_name != 'workflow_dispatch' || inputs.diagnostics != true
     steps:
@@ -79,7 +83,7 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             tag="$GITHUB_REF_NAME"
             if ! echo "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-[0-9]{8}$'; then
-              echo "::error::tag '$tag' 不符合格式 v<semver>-<YYYYMMDD>，例如 v1.0.0-20261116"
+              echo "::error::tag '$tag' 不符合格式 v<semver>-<YYYYMMDD>，例如 v1.0.0-20261118"
               exit 1
             fi
             version="${tag#v}"
@@ -92,7 +96,7 @@ jobs:
             version="${VERSION_INPUT:-0.0.0-snapshot.${RUN_NUMBER}}"
             datecode="$(date +%Y%m%d)"
             if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-              echo "::error::版本号 '$version' 不是合法 semver（示例：1.0.0-20261116）"
+              echo "::error::版本号 '$version' 不是合法 semver（示例：1.0.0-20261118）"
               exit 1
             fi
           fi
@@ -121,8 +125,7 @@ jobs:
         run: pnpm lint
 
       # 注意：不能用 pnpm build——pnpm 在 Windows 上用 cmd.exe 执行脚本，
-      # “NODE_ENV=production ...” 前缀语法会失败；这里在 bash 中等价直调（与
-      # package.json 的 build 脚本行为一致：rm -rf dist && NODE_ENV=production rspack build）。
+      # “NODE_ENV=production ...” 前缀语法会失败；这里在 bash 中等价直调
       - name: Build web app
         run: |
           set -euo pipefail
@@ -132,8 +135,8 @@ jobs:
       - name: Generate placeholder icon
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/gopack"
-          cd "$RUNNER_TEMP/gopack"
+          mkdir -p "$GITHUB_WORKSPACE/.tauri-pack"
+          cd "$GITHUB_WORKSPACE/.tauri-pack"
           cat > icon.svg <<'EOF'
           <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
             <defs>
@@ -150,168 +153,164 @@ jobs:
             <circle cx="612" cy="454" r="34" fill="#4f8cff"/>
           </svg>
           EOF
-          npm install --no-fund --no-audit --no-save sharp-cli @tauri-apps/cli@latest
-          npx --no-install sharp-cli -i icon.svg -o icon-1024.png resize 1024 1024
-          npx --no-install tauri icon icon-1024.png --output tauri-icons
+          # 用 pnpm 而非 npm：脚手架位于 workspace 内时，npm 向上探测到项目的
+          # pnpm-lock.yaml 会触发 "Cannot read properties of null (reading 'matches')"。
+          # 不用 pnpm exec（会走 recursive 模式找不到 bin），直接用 .bin 下的可执行文件。
+          pnpm init >/dev/null
+          pnpm add -D sharp-cli @tauri-apps/cli@2
+          ls node_modules/.bin
+          # sharp-cli 包的实际 bin 名是 sharp（不是 sharp-cli）
+          node_modules/.bin/sharp -i icon.svg -o icon-1024.png resize 1024 1024
+          node_modules/.bin/tauri icon icon-1024.png --output tauri-icons
           ls -l tauri-icons
 
-      - name: Generate Go server scaffold
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/gopack"
-          cp -r "$GITHUB_WORKSPACE/dist" dist
-          cat > go.mod <<'EOF'
-          module chatdemo
-
-          go 1.24
-          EOF
-          cat > main.go <<'EOF'
-          package main
-
-          import (
-          	"bufio"
-          	"embed"
-          	"flag"
-          	"fmt"
-          	"io/fs"
-          	"log"
-          	"net"
-          	"net/http"
-          	"os"
-          	"os/exec"
-          	"os/signal"
-          	"runtime"
-          	"syscall"
-          	"time"
-          )
-
-          // dist 为内嵌的静态站点（由 CI 在构建前拷入本目录）。
-          //
-          //go:embed all:dist
-          var distFS embed.FS
-
-          // version 由 CI 通过 -ldflags "-X main.version=..." 注入（取自发布 tag）。
-          var version = "dev"
-
-          // 固定默认端口：浏览器按“来源（协议+域名+端口）”隔离 localStorage/IndexedDB，
-          // 随机端口会导致每次启动都看不到历史聊天记录，因此默认固定为 9999。
-          const defaultPort = "9999"
-
-          func main() {
-          	port := flag.String("port", defaultPort, "HTTP 监听端口（默认 9999；更换端口将无法看到原端口下保存的聊天记录）")
-          	flag.Parse()
-
-          	addr := net.JoinHostPort("127.0.0.1", *port)
-          	ln, err := net.Listen("tcp", addr)
-          	if err != nil {
-          		fatal(fmt.Sprintf("无法监听 %s：%v\n端口可能已被占用，可用 -port <端口号> 更换（浏览器按端口隔离站点存储，换端口后看不到旧聊天记录）。",
-          			addr, err))
-          	}
-
-          	sub, err := fs.Sub(distFS, "dist")
-          	if err != nil {
-          		fatal(fmt.Sprintf("读取内嵌资源失败：%v", err))
-          	}
-
-          	url := fmt.Sprintf("http://127.0.0.1:%s", *port)
-
-          	log.Printf("Chat Demo %s", version)
-          	log.Printf("本地服务已启动：%s", url)
-          	log.Printf("正在自动打开浏览器…请保持本窗口开启，关闭窗口或按 Ctrl+C 即退出。")
-          	log.Printf("提示：-port 可更换端口，-h 查看帮助。")
-
-          	openBrowser(url)
-
-          	srv := &http.Server{
-          		Handler:           withLog(http.FileServer(http.FS(sub))),
-          		ReadHeaderTimeout: 10 * time.Second,
-          	}
-
-          	go func() {
-          		sig := make(chan os.Signal, 1)
-          		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-          		<-sig
-          		log.Println("收到退出信号，正在关闭…")
-          		_ = srv.Close()
-          		os.Exit(0)
-          	}()
-
-          	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-          		fatal(fmt.Sprintf("服务异常退出：%v", err))
-          	}
-          }
-
-          // withLog 为每条请求输出一行访问日志。
-          func withLog(next http.Handler) http.Handler {
-          	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-          		start := time.Now()
-          		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-          		next.ServeHTTP(rec, r)
-          		log.Printf("%-4s %-28s %d %6dms  %s",
-          			r.Method, r.URL.Path, rec.status, time.Since(start).Milliseconds(), r.RemoteAddr)
-          	})
-          }
-
-          type statusRecorder struct {
-          	http.ResponseWriter
-          	status int
-          }
-
-          func (r *statusRecorder) WriteHeader(code int) {
-          	r.status = code
-          	r.ResponseWriter.WriteHeader(code)
-          }
-
-          func openBrowser(url string) {
-          	var cmd *exec.Cmd
-          	switch runtime.GOOS {
-          	case "windows":
-          		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
-          	case "darwin":
-          		cmd = exec.Command("open", url)
-          	default:
-          		cmd = exec.Command("xdg-open", url)
-          	}
-          	if err := cmd.Start(); err != nil {
-          		log.Printf("自动打开浏览器失败，请手动访问上面的地址：%v", err)
-          	}
-          }
-
-          // fatal 输出错误并等待回车，避免双击启动时控制台一闪而过看不到原因。
-          func fatal(msg string) {
-          	fmt.Fprintln(os.Stderr, "\n[错误] "+msg)
-          	fmt.Fprint(os.Stderr, "\n按回车键退出…")
-          	_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
-          	os.Exit(1)
-          }
-          EOF
-
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: stable
-
-      - name: Embed application icon
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP/gopack"
-          go run github.com/akavel/rsrc@latest -ico tauri-icons/icon.ico -arch amd64 -o rsrc_windows_amd64.syso \
-            || echo "::warning::跳过 exe 图标嵌入（rsrc 执行失败，不影响功能）"
-
-      - name: Build exe
+      - name: Scaffold Tauri project
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP/gopack"
-          go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "ChatDemo-${VERSION}-windows-x64.exe" .
-          ls -l ChatDemo-*.exe
+          cd "$GITHUB_WORKSPACE/.tauri-pack"
+          cp -r "$GITHUB_WORKSPACE/dist" dist
+          mkdir -p src-tauri/src src-tauri/capabilities src-tauri/icons
+          # tauri-build 在 Windows 上编译期要求 icons/icon.ico 存在（生成资源文件），
+          # 因此拷贝 tauri icon 生成的全套图标而非仅 icon.png
+          cp -r tauri-icons/* src-tauri/icons/
+          # tauri.conf.json 与 Cargo.toml 必须同目录（Tauri 标准布局：src-tauri/），
+          # 否则 CLI 在错误的位置找 Cargo.toml；frontendDist 相对 conf 所在目录
+          cat > src-tauri/tauri.conf.json <<'EOF'
+          {
+            "$schema": "https://schema.tauri.app/config/2",
+            "productName": "Chat Demo",
+            "version": "VERSION_PLACEHOLDER",
+            "identifier": "io.github.lliangworld.chatdemo",
+            "mainBinaryName": "chatdemo",
+            "build": {
+              "frontendDist": "../dist"
+            },
+            "app": {
+              "windows": [],
+              "security": {
+                "csp": null
+              }
+            },
+            "bundle": {
+              "active": false
+            }
+          }
+          EOF
+          cat > src-tauri/Cargo.toml <<'EOF'
+          [package]
+          name = "chatdemo"
+          version = "VERSION_PLACEHOLDER"
+          edition = "2024"
+
+          [build-dependencies]
+          tauri-build = { version = "2", features = [] }
+
+          [dependencies]
+          tauri = { version = "2", features = [] }
+          tauri-plugin-opener = { version = "2", features = [] }
+
+          [profile.release]
+          codegen-units = 1
+          lto = true
+          opt-level = 3
+          panic = "abort"
+          strip = true
+          EOF
+          cat > src-tauri/build.rs <<'EOF'
+          fn main() {
+              tauri_build::build()
+          }
+          EOF
+          cat > src-tauri/capabilities/default.json <<'EOF'
+          {
+            "$schema": "../gen/schemas/desktop-schema.json",
+            "identifier": "default",
+            "description": "Default capability for the main window",
+            "windows": ["main"],
+            "permissions": ["core:default", "opener:default"]
+          }
+          EOF
+          cat > src-tauri/src/main.rs <<'EOF'
+          #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+          // Tauri 2 中 App::handle() 为固有方法，无需 use tauri::Manager
+          use tauri::webview::{NewWindowResponse, PermissionResponse, WebviewWindowBuilder};
+          use tauri_plugin_opener::OpenerExt;
+
+          fn main() {
+              tauri::Builder::default()
+                  .plugin(tauri_plugin_opener::init())
+                  .setup(|app| {
+                      let handle = app.handle().clone();
+                      WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
+                          .title("Chat Demo")
+                          .inner_size(1080.0, 760.0)
+                          .min_inner_size(360.0, 480.0)
+                          // 外链（含 Markdown 渲染的普通 <a href>）转系统浏览器，
+                          // 不在窗口内导航走。初始页面加载也过此回调，必须放行应用自身 origin。
+                          .on_navigation(move |url| {
+                              let is_app = url.scheme() == "tauri"
+                                  || url.host_str() == Some("tauri.localhost")
+                                  || (tauri::is_dev()
+                                      && (url.host_str() == Some("localhost")
+                                          || url.host_str() == Some("127.0.0.1")));
+                              if is_app {
+                                  return true;
+                              }
+                              let _ = handle.opener().open_url(url.as_str(), None::<&str>);
+                              false
+                          })
+                          // target=_blank / window.open 一律拦截，由 opener 插件 init script 接管
+                          .on_new_window(|url, _features| {
+                              let is_app = url.scheme() == "tauri"
+                                  || url.host_str() == Some("tauri.localhost");
+                              if is_app {
+                                  NewWindowResponse::Allow
+                              } else {
+                                  NewWindowResponse::Deny
+                              }
+                          })
+                  // 应用只可能请求麦克风（语音输入），直接允许，免 WebView2 原生提示
+                  .on_permission_request(|_, _| PermissionResponse::Allow)
+                          .build()?;
+                      Ok(())
+                  })
+                  .run(tauri::generate_context!())
+                  .expect("error while running tauri application");
+          }
+          EOF
+          sed -i "s/VERSION_PLACEHOLDER/$VERSION/" src-tauri/tauri.conf.json src-tauri/Cargo.toml
+          grep -n '"version"' src-tauri/tauri.conf.json
+          grep -n '^version' src-tauri/Cargo.toml
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: .tauri-pack/src-tauri
+
+      - name: Build Tauri exe
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/.tauri-pack/src-tauri"
+          ../node_modules/.bin/tauri build --no-bundle
+          # 产物放到 workspace 根：upload-artifact 的 glob 不匹配点开头的隐藏目录段
+          cp target/release/chatdemo.exe "$GITHUB_WORKSPACE/ChatDemo-${VERSION}-windows-x64.exe"
+          ls -l "$GITHUB_WORKSPACE"/ChatDemo-*.exe
 
       - name: Upload exe artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-exe
-          path: ${{ runner.temp }}/gopack/ChatDemo-*.exe
+          path: ChatDemo-*.exe
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
@@ -573,7 +572,7 @@ jobs:
   release:
     name: Publish GitHub Release
     if: github.ref_type == 'tag'
-    needs: [build-windows-exe, build-android-apk]
+    needs: [build-tauri-exe, build-android-apk]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
