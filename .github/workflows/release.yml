@@ -38,6 +38,11 @@ on:
         description: '版本号（合法 semver，如 1.0.0-20261116），留空用 0.0.0-snapshot.<run_number>'
         required: false
         type: string
+      diagnostics:
+        description: '仅构建 APK 并注入诊断浮层（显示 frame 高度/视口单位实测值），用于排查 APK 白屏；跳过 exe 与 Release'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -58,6 +63,8 @@ jobs:
     name: Windows exe (local server + browser)
     runs-on: windows-latest
     timeout-minutes: 20
+    # 诊断模式只构建 APK，跳过 exe
+    if: github.event_name != 'workflow_dispatch' || inputs.diagnostics != true
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -394,6 +401,81 @@ jobs:
           EOF
           mkdir -p www
           cp -r "$GITHUB_WORKSPACE/dist"/. www/
+          # 诊断模式：向 www/index.html 注入诊断浮层（装机后屏幕顶部显示 frame 高度/
+          # 视口单位实测值等指标，点击可折叠）。必须在 cap sync 之前注入才会进入 APK。
+          if [ "${{ inputs.diagnostics }}" = "true" ]; then
+            cat > diag.js <<'DIAGEOF'
+            (function () {
+              var TAG = 'chatdemo-diagnostics';
+              if (document.getElementById(TAG)) { return; }
+
+              function probe(value) {
+                var el = document.createElement('div');
+                el.style.position = 'fixed';
+                el.style.left = '-9999px';
+                el.style.height = value;
+                document.body.appendChild(el);
+                var h = getComputedStyle(el).height;
+                el.remove();
+                return h;
+              }
+
+              function metrics() {
+                var frame = document.querySelector('#root > div');
+                var root = document.getElementById('root');
+                var cs = frame ? getComputedStyle(frame) : null;
+                var rect = frame ? frame.getBoundingClientRect() : null;
+                var vv = window.visualViewport;
+                return [
+                  'UA: ' + navigator.userAgent,
+                  'matchMobile(<768): ' + matchMedia('not all and (min-width: 768px)').matches,
+                  'innerWidth: ' + window.innerWidth + '  innerHeight: ' + window.innerHeight,
+                  'documentElement.clientHeight: ' + document.documentElement.clientHeight,
+                  'screen.height: ' + screen.height,
+                  'visualViewport: ' + (vv ? vv.width + 'x' + vv.height + ' scale=' + vv.scale + ' offsetTop=' + vv.offsetTop : 'null'),
+                  'CSS.supports dvh: ' + (window.CSS ? CSS.supports('height', '100dvh') : 'n/a') + ' | vh: ' + (window.CSS ? CSS.supports('height', '100vh') : 'n/a'),
+                  'PROBE 100dvh => ' + probe('100dvh') + ' | 100vh => ' + probe('100vh') + ' | 100% => ' + probe('100%'),
+                  'root height: ' + (root ? getComputedStyle(root).height : 'n/a'),
+                  'frame height: ' + (cs ? cs.height : 'no-frame') + ' | position: ' + (cs ? cs.position : '-'),
+                  'frame rect: ' + (rect ? 'top=' + Math.round(rect.top) + ' height=' + Math.round(rect.height) : 'no-frame'),
+                  'frame inline style: ' + (frame ? (frame.getAttribute('style') || '(none)') : 'no-frame'),
+                  'body height: ' + getComputedStyle(document.body).height
+                ].join('\n');
+              }
+
+              function render() {
+                var box = document.getElementById(TAG);
+                if (!box) {
+                  box = document.createElement('pre');
+                  box.id = TAG;
+                  box.setAttribute('data-expanded', '1');
+                  box.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:2147483647;margin:0;padding:6px 8px;max-height:60%;overflow:auto;background:rgba(0,0,0,.85);color:#0f0;font:11px/1.45 monospace;white-space:pre-wrap;word-break:break-all;text-align:left';
+                  box.addEventListener('click', function () {
+                    if (box.getAttribute('data-expanded') === '1') {
+                      box.setAttribute('data-expanded', '0');
+                      box.style.maxHeight = '18px';
+                      box.style.overflow = 'hidden';
+                      box.style.whiteSpace = 'nowrap';
+                    } else {
+                      box.setAttribute('data-expanded', '1');
+                      box.style.maxHeight = '60%';
+                      box.style.overflow = 'auto';
+                      box.style.whiteSpace = 'pre-wrap';
+                    }
+                  });
+                  document.body.appendChild(box);
+                }
+                box.textContent = '[诊断浮层·点击折叠/展开] ' + new Date().toLocaleTimeString() + '\n' + metrics();
+                console.log('[diagnostics] ' + new Date().toLocaleTimeString() + '\n' + metrics());
+              }
+
+              setInterval(render, 2000);
+              if (document.readyState === 'complete') { render(); } else { window.addEventListener('load', render); }
+            })();
+          DIAGEOF
+          node -e "const fs=require('fs');const p='www/index.html';let s=fs.readFileSync(p,'utf8');const d=fs.readFileSync('diag.js','utf8');if(!s.includes('chatdemo-diagnostics')){s=s.replace('</body>','<!--chatdemo-diagnostics--><script>'+d+'</script>\n</body>');}fs.writeFileSync(p,s);"
+            grep -c 'chatdemo-diagnostics' www/index.html
+          fi
           npx cap add android
           npx cap sync android
 

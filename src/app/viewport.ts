@@ -68,11 +68,15 @@ export const useMobileViewport = (enabled: boolean) => {
         reset()
         return
       }
-      frame.style.setProperty(
-        '--app-viewport-height',
-        `${viewport?.height ?? window.innerHeight}px`
-      )
-      frame.style.setProperty('--app-viewport-top', `${viewport?.offsetTop ?? 0}px`)
+      // 旧版 WebView 的 visualViewport 读数可能异常（0 或超范围），钳制后再写入，
+      // 避免容器高度被写塌；正常读数时不超过 innerHeight。
+      const viewportHeight = viewport?.height
+      const height =
+        viewportHeight && viewportHeight > 0
+          ? Math.min(viewportHeight, window.innerHeight)
+          : window.innerHeight
+      frame.style.setProperty('--app-viewport-height', `${height}px`)
+      frame.style.setProperty('--app-viewport-top', `${Math.max(viewport?.offsetTop ?? 0, 0)}px`)
     }
     const scheduleFrame = () => {
       cancelAnimationFrame(animationFrame)
