@@ -19,10 +19,14 @@
 # 桌面 exe：Tauri 2 原生壳（Rust + 系统 WebView2），CI 生成脚手架并内嵌 dist，
 #   产物为单文件 exe（约 5MB），双击即用；Win10 1803+/Win11 自带 WebView2。
 #   外链自动转系统浏览器打开；麦克风免权限弹窗；原生 GUI 窗口（无控制台）。
-#   数据存放于独立 WebView2 profile（与浏览器、旧版 Go exe、APK 互不相通）：
-#     API Key 与设置：%LOCALAPPDATA%\io.github.lliangworld.chatdemo\EBWebView\Default\Local Storage\leveldb\
-#     对话与附件：     %LOCALAPPDATA%\io.github.lliangworld.chatdemo\EBWebView\Default\IndexedDB\http_tauri.localhost_0.indexeddb.leveldb\
-#   删除/替换 exe 不丢数据；重装保留；备份=退出应用后拷贝上述目录；清除=删除 EBWebView。
+#   数据便携化：运行时数据（localStorage/IndexedDB/缓存）存放在 exe 同级 data
+#   目录（不存在则自动创建），删除 data 目录即可清除全部关联文件，无需去 C 盘找：
+#     API Key 与设置：data\Default\Local Storage\leveldb\
+#     对话与附件：     data\Default\IndexedDB\http_tauri.localhost_0.indexeddb.leveldb\
+#   exe 放到只读位置（如 Program Files）时自动回退默认位置
+#   %LOCALAPPDATA%\io.github.lliangworld.chatdemo\EBWebView（v1.0.1 行为，
+#   旧数据不自动迁移：手动把旧 EBWebView 目录内容拷进 data\ 即可）。
+#   注意：数据跟随 exe 所在文件夹，把 exe 拷到别处运行 = 全新数据。
 #
 # 已知限制：产物未签名（SmartScreen / Play Protect 会提示，正常）；APK 为 CI
 #   临时 debug 签名，升级安装需先卸载旧版，且不能上架商店；Tauri exe 首次构建
@@ -244,10 +248,25 @@ jobs:
                   .plugin(tauri_plugin_opener::init())
                   .setup(|app| {
                       let handle = app.handle().clone();
-                      WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
-                          .title("Chat Demo")
-                          .inner_size(1080.0, 760.0)
-                          .min_inner_size(360.0, 480.0)
+                      let mut builder =
+                          WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
+                              .title("Chat Demo")
+                              .inner_size(1080.0, 760.0)
+                              .min_inner_size(360.0, 480.0);
+                      // 便携模式：运行时数据（localStorage/IndexedDB/缓存）放到 exe 同级
+                      // data 目录，删除 data 目录即可清除全部关联文件；不存在则自动创建。
+                      // exe 放在只读位置（如 Program Files）导致创建失败时，回退 Tauri
+                      // 默认位置（%LOCALAPPDATA%\io.github.lliangworld.chatdemo\EBWebView）。
+                      let data_dir = std::env::current_exe()
+                          .ok()
+                          .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                          .map(|d| d.join("data"));
+                      if let Some(dir) = data_dir {
+                          if std::fs::create_dir_all(&dir).is_ok() {
+                              builder = builder.data_directory(dir);
+                          }
+                      }
+                      builder
                           // 外链（含 Markdown 渲染的普通 <a href>）转系统浏览器，
                           // 不在窗口内导航走。初始页面加载也过此回调，必须放行应用自身 origin。
                           .on_navigation(move |url| {
@@ -272,8 +291,8 @@ jobs:
                                   NewWindowResponse::Deny
                               }
                           })
-                  // 应用只可能请求麦克风（语音输入），直接允许，免 WebView2 原生提示
-                  .on_permission_request(|_, _| PermissionResponse::Allow)
+                          // 应用只可能请求麦克风（语音输入），直接允许，免 WebView2 原生提示
+                          .on_permission_request(|_, _| PermissionResponse::Allow)
                           .build()?;
                       Ok(())
                   })
